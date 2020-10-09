@@ -33,6 +33,7 @@ type Batcher struct {
 	MaxFlushInterval time.Duration         // MaxFlushInterval is the maximum amount of time to wait before flushing
 	MaxLineLength    int                   // MaxLineLength specifies the maximum length of a single line
 	Service          platform.WriteService // Service receives batches flushed from Batcher.
+	RetryStrategy    RetryStrategy         // RetryStrategy is a strategy that computes pauses between retries
 }
 
 // Write reads r in batches and sends to the output.
@@ -110,11 +111,21 @@ func (b *Batcher) write(ctx context.Context, org, bucket platform.ID, lines <-ch
 		maxBytes = DefaultMaxBytes
 	}
 
+	retryStrategy := b.RetryStrategy
+	if retryStrategy == nil {
+		retryStrategy = DefaultRetryStrategy
+	}
+
 	timer := time.NewTimer(flushInterval)
 	defer func() { _ = timer.Stop() }()
 
 	buf := make([]byte, 0, maxBytes)
-	r := bytes.NewReader(buf)
+	writeData := func(data []byte) error {
+		// write and possibly retry upon failure at most `b.MaxRetries`-times
+		return retry(ctx, retryStrategy, func() (err error) {
+			return b.Service.Write(ctx, org, bucket, bytes.NewReader(data))
+		})
+	}
 
 	var line []byte
 	var more = true
@@ -127,9 +138,8 @@ func (b *Batcher) write(ctx context.Context, org, bucket platform.ID, lines <-ch
 			}
 			// write if we exceed the max lines OR read routine has finished
 			if len(buf) >= maxBytes || (!more && len(buf) > 0) {
-				r.Reset(buf)
 				timer.Reset(flushInterval)
-				if err := b.Service.Write(ctx, org, bucket, r); err != nil {
+				if err := writeData(buf); err != nil {
 					errC <- err
 					return
 				}
@@ -137,9 +147,8 @@ func (b *Batcher) write(ctx context.Context, org, bucket platform.ID, lines <-ch
 			}
 		case <-timer.C:
 			if len(buf) > 0 {
-				r.Reset(buf)
 				timer.Reset(flushInterval)
-				if err := b.Service.Write(ctx, org, bucket, r); err != nil {
+				if err := writeData(buf); err != nil {
 					errC <- err
 					return
 				}
